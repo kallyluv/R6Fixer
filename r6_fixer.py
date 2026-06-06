@@ -186,16 +186,25 @@ def apply_adapter_network_settings(
         dns_script = (
             "$ErrorActionPreference='Stop';"
             f"$alias='{escaped_alias}';"
-            "Set-DnsClientServerAddress "
-            "-InterfaceAlias $alias "
-            f"-ServerAddresses @('{CLOUDFLARE_DNS_IPV4[0]}','{CLOUDFLARE_DNS_IPV4[1]}') "
-            "-AddressFamily IPv4;"
-            "try { Set-DnsClientServerAddress -InterfaceAlias $alias -AddressFamily IPv6 "
-            "-ServerAddresses @('"
+            "$dnsCombined=@('"
+            + CLOUDFLARE_DNS_IPV4[0]
+            + "','"
+            + CLOUDFLARE_DNS_IPV4[1]
+            + "','"
             + CLOUDFLARE_DNS_IPV6[0]
             + "','"
             + CLOUDFLARE_DNS_IPV6[1]
-            + "') -ErrorAction Stop } catch { }"
+            + "');"
+            "$dnsIpv4=@('"
+            + CLOUDFLARE_DNS_IPV4[0]
+            + "','"
+            + CLOUDFLARE_DNS_IPV4[1]
+            + "');"
+            "try {"
+            "  Set-DnsClientServerAddress -InterfaceAlias $alias -ServerAddresses $dnsCombined -ErrorAction Stop"
+            "} catch {"
+            "  Set-DnsClientServerAddress -InterfaceAlias $alias -ServerAddresses $dnsIpv4 -ErrorAction Stop"
+            "}"
         )
         total += 1
         ok_dns, out_dns = run_command(
@@ -707,8 +716,8 @@ class R6FixerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1240x820")
-        self.root.minsize(1060, 700)
+        self.root.geometry("1160x820")
+        self.root.minsize(940, 680)
 
         self.user_sources: dict[str, list[str]] = {}
         self.ban_status: dict[str, str] = {}
@@ -716,23 +725,25 @@ class R6FixerApp:
 
         self._configure_styles()
         self._build_ui()
-        self.run_async("Refreshing discovered users", self.refresh_users)
+        self.run_async("Refreshing discovered users", self.refresh_users_and_bans)
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self.root)
-        for theme in ("vista", "clam", "default"):
+        for theme in ("clam", "vista", "default"):
             try:
                 style.theme_use(theme)
                 break
             except tk.TclError:
                 continue
 
-        style.configure("Title.TLabel", font=("Segoe UI Semibold", 16))
-        style.configure("Subtitle.TLabel", font=("Segoe UI", 10))
-        style.configure("SectionHeader.TLabel", font=("Segoe UI Semibold", 11))
-        style.configure("Hint.TLabel", font=("Segoe UI", 9))
-        style.configure("Action.TButton", padding=(10, 6))
+        style.configure("Title.TLabel", font=("Segoe UI Semibold", 16), foreground="#0f172a")
+        style.configure("Subtitle.TLabel", font=("Segoe UI", 10), foreground="#334155")
+        style.configure("SectionHeader.TLabel", font=("Segoe UI Semibold", 11), foreground="#0f172a")
+        style.configure("Hint.TLabel", font=("Segoe UI", 9), foreground="#475569")
+        style.configure("Action.TButton", padding=(10, 7))
         style.configure("Section.TLabelframe.Label", font=("Segoe UI Semibold", 10))
+        style.configure("TNotebook", padding=2)
+        style.configure("TNotebook.Tab", padding=(12, 8), font=("Segoe UI", 10))
 
     def _set_pane_position(self, pane: ttk.Panedwindow, index: int, position: int) -> None:
         try:
@@ -757,8 +768,25 @@ class R6FixerApp:
         def sync_content_width(event: tk.Event) -> None:
             canvas.itemconfigure(window_id, width=event.width)
 
+        def on_mousewheel(event: tk.Event) -> None:
+            delta = getattr(event, "delta", 0)
+            if delta:
+                canvas.yview_scroll(int(-delta / 120), "units")
+
+        def bind_wheel(_event: tk.Event) -> None:
+            canvas.bind_all("<MouseWheel>", on_mousewheel)
+
+        def unbind_wheel(_event: tk.Event) -> None:
+            canvas.unbind_all("<MouseWheel>")
+
         content.bind("<Configure>", sync_scroll_region)
         canvas.bind("<Configure>", sync_content_width)
+        wrapper.bind("<Enter>", bind_wheel)
+        wrapper.bind("<Leave>", unbind_wheel)
+        canvas.bind("<Enter>", bind_wheel)
+        canvas.bind("<Leave>", unbind_wheel)
+        content.bind("<Enter>", bind_wheel)
+        content.bind("<Leave>", unbind_wheel)
 
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
@@ -832,28 +860,62 @@ class R6FixerApp:
             container,
             text=description,
             style="Subtitle.TLabel",
-            wraplength=1200,
+            wraplength=1120,
             justify="left",
         ).pack(
             fill="x", pady=(0, 10)
         )
 
-        split = ttk.Panedwindow(container, orient=tk.HORIZONTAL)
-        split.pack(fill="both", expand=True)
+        notebook = ttk.Notebook(container)
+        notebook.pack(fill="both", expand=True)
 
-        left = ttk.Frame(split, padding=8)
-        right = ttk.Frame(split, padding=8)
-        split.add(left, weight=1)
-        split.add(right, weight=2)
+        accounts_tab = ttk.Frame(notebook, padding=10)
+        game_tab = ttk.Frame(notebook, padding=10)
+        network_tab = ttk.Frame(notebook, padding=10)
+        system_tab = ttk.Frame(notebook, padding=10)
+        logs_tab = ttk.Frame(notebook, padding=10)
 
-        self.root.after(120, lambda: self._set_pane_position(split, 0, 380))
+        notebook.add(accounts_tab, text="Accounts")
+        notebook.add(game_tab, text="Game + Caches")
+        notebook.add(network_tab, text="Network")
+        notebook.add(system_tab, text="System")
+        notebook.add(logs_tab, text="Logs")
 
-        self._build_users_panel(left)
-        self._build_actions_panel(right)
+        self._build_accounts_tab(accounts_tab)
+        self._build_game_tab(game_tab)
+        self._build_network_tab(network_tab)
+        self._build_system_tab(system_tab)
+        self._build_logs_tab(logs_tab)
 
-    def _build_users_panel(self, parent: ttk.Frame) -> None:
+    def _add_simple_action(
+        self,
+        parent: ttk.Frame,
+        title: str,
+        description: str,
+        button_text: str,
+        command,
+    ) -> None:
+        block = ttk.LabelFrame(parent, text=title, style="Section.TLabelframe", padding=10)
+        block.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(
+            block,
+            text=description,
+            style="Hint.TLabel",
+            wraplength=980,
+            justify="left",
+        ).pack(anchor="w", fill="x", pady=(0, 8))
+
+        ttk.Button(block, text=button_text, style="Action.TButton", command=command).pack(
+            anchor="w"
+        )
+
+    def _build_accounts_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
         header = ttk.Frame(parent)
-        header.pack(fill="x")
+        header.grid(row=0, column=0, sticky="ew")
 
         ttk.Label(header, text="Discovered Ubisoft Users", style="SectionHeader.TLabel").pack(
             side="left",
@@ -865,68 +927,72 @@ class R6FixerApp:
             anchor="e",
         )
 
+        table_frame = ttk.Frame(parent)
+        table_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+
         columns = ("user_id", "locations", "ban")
-        self.user_tree = ttk.Treeview(parent, columns=columns, show="headings", height=13)
+        self.user_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=12)
         self.user_tree.heading("user_id", text="User ID")
         self.user_tree.heading("locations", text="Sources")
         self.user_tree.heading("ban", text="Ban Status")
-        self.user_tree.column("user_id", width=280)
-        self.user_tree.column("locations", width=70, anchor="center")
-        self.user_tree.column("ban", width=95, anchor="center")
+        self.user_tree.column("user_id", width=500, anchor="w")
+        self.user_tree.column("locations", width=90, anchor="center")
+        self.user_tree.column("ban", width=120, anchor="center")
         self.user_tree.bind("<<TreeviewSelect>>", self._on_user_select)
 
-        table_frame = ttk.Frame(parent)
-        table_frame.pack(fill="both", expand=True, pady=(8, 8))
+        tree_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.user_tree.yview)
+        self.user_tree.configure(yscrollcommand=tree_scroll.set)
 
-        scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.user_tree.yview)
-        self.user_tree.configure(yscrollcommand=scroll.set)
+        self.user_tree.grid(row=0, column=0, sticky="nsew")
+        tree_scroll.grid(row=0, column=1, sticky="ns")
 
-        self.user_tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-
-        button_row = ttk.Frame(parent)
-        button_row.pack(fill="x", pady=(2, 8))
-        button_row.columnconfigure(0, weight=1)
-        button_row.columnconfigure(1, weight=1)
+        actions = ttk.LabelFrame(parent, text="User Actions", style="Section.TLabelframe", padding=10)
+        actions.grid(row=2, column=0, sticky="ew", pady=(0, 8))
 
         ttk.Button(
-            button_row,
+            actions,
             text="Refresh Users",
             style="Action.TButton",
-            command=lambda: self.run_async("Refreshing discovered users", self.refresh_users),
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
+            command=lambda: self.run_async("Refreshing discovered users", self.refresh_users_and_bans),
+        ).pack(fill="x", pady=(0, 6))
 
         ttk.Button(
-            button_row,
+            actions,
             text="Check Ban Status",
             style="Action.TButton",
             command=self.start_check_bans,
-        ).grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=(0, 4))
+        ).pack(fill="x", pady=(0, 6))
 
         ttk.Button(
-            button_row,
+            actions,
             text="Clean Selected Users",
             style="Action.TButton",
             command=self.prompt_cleanup_selected,
-        ).grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        ).pack(fill="x", pady=(0, 6))
 
         ttk.Button(
-            button_row,
+            actions,
             text="Clean Banned Users",
             style="Action.TButton",
             command=self.prompt_cleanup_banned,
-        ).grid(row=1, column=1, sticky="ew", padx=(4, 0))
+        ).pack(fill="x")
 
-        ttk.Label(parent, text="Selected User Sources", style="SectionHeader.TLabel").pack(
-            anchor="w", pady=(2, 4)
+        source_group = ttk.LabelFrame(
+            parent,
+            text="Selected User Sources",
+            style="Section.TLabelframe",
+            padding=8,
         )
+        source_group.grid(row=3, column=0, sticky="ew")
 
-        source_frame = ttk.Frame(parent)
-        source_frame.pack(fill="both", expand=False)
+        source_frame = ttk.Frame(source_group)
+        source_frame.pack(fill="both", expand=True)
 
         self.source_text = tk.Text(
             source_frame,
-            height=8,
+            height=6,
             wrap="word",
             relief="solid",
             borderwidth=1,
@@ -942,83 +1008,60 @@ class R6FixerApp:
             "Select a user to view all locations where this ID was found.",
         )
 
-    def _build_actions_panel(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="Optimization Actions", style="SectionHeader.TLabel").pack(anchor="w")
-
-        actions_host = ttk.Frame(parent)
-        actions_host.pack(fill="both", expand=True, pady=(8, 8))
-        actions = self._create_scrollable_frame(actions_host)
-
-        profile_section = ttk.LabelFrame(
-            actions,
-            text="Profile Optimization",
-            style="Section.TLabelframe",
-            padding=10,
-        )
-        profile_section.pack(fill="x", pady=(0, 8))
-        profile_section.columnconfigure(0, weight=1)
-        self._add_action_block(
-            profile_section,
-            0,
+    def _build_game_tab(self, parent: ttk.Frame) -> None:
+        self._add_simple_action(
+            parent,
+            "GameSettings Optimization",
+            "Apply optimized GameSettings values to all discovered Rainbow Six user profiles.",
             "Apply GameSettings To All Profiles",
-            "Uses the project GameSettings.ini template and writes optimized keys to all detected profiles.",
             lambda: self.run_async("Applying GameSettings template", self.apply_gamesettings_to_all),
         )
-
-        cleanup_section = ttk.LabelFrame(
-            actions,
-            text="Cache Cleanup",
-            style="Section.TLabelframe",
-            padding=10,
-        )
-        cleanup_section.pack(fill="x", pady=(0, 8))
-        cleanup_section.columnconfigure(0, weight=1)
-        row = 0
-        row = self._add_action_block(
-            cleanup_section,
-            row,
+        self._add_simple_action(
+            parent,
+            "Rainbow Six Shader Cache",
+            "Clear local Rainbow Six shader cache files to help with stutter after updates.",
             "Clear Rainbow Six Shader Cache",
-            "Clears %LOCALAPPDATA%/Ubisoft/Rainbow Six - Siege cache files.",
             lambda: self.run_async("Clearing Rainbow Six shader cache", self.clear_r6_shader_cache),
         )
-        row = self._add_action_block(
-            cleanup_section,
-            row,
+        self._add_simple_action(
+            parent,
+            "Ubisoft Launcher Cache",
+            "Clear Ubisoft launcher cache under ProgramData.",
             "Clear Ubisoft Launcher Cache",
-            "Clears ProgramData Ubisoft launcher cache contents.",
             lambda: self.run_async("Clearing Ubisoft launcher cache", self.clear_ubisoft_cache),
         )
-        self._add_action_block(
-            cleanup_section,
-            row,
+        self._add_simple_action(
+            parent,
+            "DirectX Shader Cache",
+            "Clear DirectX and common vendor shader caches (NVIDIA/AMD).",
             "Clear DirectX Shader Cache",
-            "Removes D3D, NVIDIA, and AMD shader caches from LocalAppData where available.",
             lambda: self.run_async("Clearing DirectX shader caches", self.clear_directx_shader_cache),
         )
 
-        network_section = ttk.LabelFrame(
-            actions,
-            text="Network Tuning",
-            style="Section.TLabelframe",
-            padding=10,
-        )
-        network_section.pack(fill="x", pady=(0, 8))
-        network_section.columnconfigure(0, weight=1)
+    def _build_network_tab(self, parent: ttk.Frame) -> None:
+        mode_box = ttk.LabelFrame(parent, text="Network Mode", style="Section.TLabelframe", padding=10)
+        mode_box.pack(fill="x", pady=(0, 10))
 
         ttk.Label(
-            network_section,
-            text="Choose a network profile:",
+            mode_box,
+            text=(
+                "Choose the profile then apply optimization. Cloudflare DNS and adapter-level tuning "
+                "will be applied to active Ethernet and Wi-Fi adapters."
+            ),
             style="Hint.TLabel",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+            wraplength=980,
+            justify="left",
+        ).pack(anchor="w", fill="x", pady=(0, 8))
 
-        mode_row = ttk.Frame(network_section)
-        mode_row.grid(row=1, column=0, sticky="w", pady=(0, 6))
+        mode_row = ttk.Frame(mode_box)
+        mode_row.pack(anchor="w")
+
         ttk.Radiobutton(
             mode_row,
             text="Latency + Stability",
             variable=self.network_mode,
             value="latency",
-        ).pack(side="left", padx=(0, 8))
+        ).pack(side="left", padx=(0, 12))
         ttk.Radiobutton(
             mode_row,
             text="Throughput + Downloads",
@@ -1026,74 +1069,67 @@ class R6FixerApp:
             value="throughput",
         ).pack(side="left")
 
-        self._add_action_block(
-            network_section,
-            2,
-            "Apply Network Optimizations",
-            (
-                "Runs global TCP tuning and applies Cloudflare DNS (1.1.1.1 / 1.0.0.1) "
-                "to active Ethernet and Wi-Fi adapters."
-            ),
-            lambda: self.run_async("Applying network optimizations", self.apply_network_optimizations),
-        )
+        ttk.Button(
+            parent,
+            text="Apply Network Optimizations",
+            style="Action.TButton",
+            command=lambda: self.run_async("Applying network optimizations", self.apply_network_optimizations),
+        ).pack(anchor="w")
 
-        system_section = ttk.LabelFrame(
-            actions,
-            text="System Tweaks",
-            style="Section.TLabelframe",
-            padding=10,
-        )
-        system_section.pack(fill="x", pady=(0, 8))
-        system_section.columnconfigure(0, weight=1)
-        row = 0
-        row = self._add_action_block(
-            system_section,
-            row,
+    def _build_system_tab(self, parent: ttk.Frame) -> None:
+        self._add_simple_action(
+            parent,
+            "Power Plan",
+            "Set Ultimate or High Performance and disable sleep/hibernate timeouts.",
             "Set High Performance Power Plan",
-            "Sets Ultimate or High Performance and disables sleep/hibernate timeouts.",
             lambda: self.run_async("Setting high performance power plan", self.set_power_plan),
         )
-        row = self._add_action_block(
-            system_section,
-            row,
+        self._add_simple_action(
+            parent,
+            "Fullscreen Compatibility",
+            "Disable fullscreen optimizations for detected Rainbow Six executables.",
             "Disable Fullscreen Optimizations",
-            "Adds AppCompat flags for detected RainbowSix executables.",
             lambda: self.run_async(
                 "Disabling fullscreen optimizations", self.disable_fullscreen_optimizations
             ),
         )
-        self._add_action_block(
-            system_section,
-            row,
+        self._add_simple_action(
+            parent,
+            "Graphics Drivers",
+            "Inspect current GPU driver versions and open update helpers.",
             "Check Graphics Driver Updates",
-            "Collects current GPU driver versions and opens relevant update helpers.",
             lambda: self.run_async("Checking graphics driver updates", self.check_driver_updates),
         )
-
-        one_click_section = ttk.LabelFrame(
-            actions,
-            text="One-Click",
-            style="Section.TLabelframe",
-            padding=10,
-        )
-        one_click_section.pack(fill="x", pady=(0, 4))
-        one_click_section.columnconfigure(0, weight=1)
-        self._add_action_block(
-            one_click_section,
-            0,
+        self._add_simple_action(
+            parent,
+            "One-Click Run",
+            "Run all key optimization actions in sequence.",
             "Run Full Optimization",
-            "Runs profile update, cache cleanup, network tuning, and system tweaks in one flow.",
             lambda: self.run_async("Running full optimization", self.run_full_optimization),
         )
 
-        ttk.Label(parent, text="Action Log", style="SectionHeader.TLabel").pack(anchor="w", pady=(4, 4))
+    def _build_logs_tab(self, parent: ttk.Frame) -> None:
+        controls = ttk.Frame(parent)
+        controls.pack(fill="x", pady=(0, 6))
 
-        self.log_text = tk.Text(parent, height=9, wrap="word", relief="solid", borderwidth=1, bg="#f8fafc")
-        self.log_text.pack(fill="both", expand=False)
-        self.log_text.configure(state="disabled")
+        ttk.Label(controls, text="Action Log", style="SectionHeader.TLabel").pack(side="left")
+        ttk.Button(controls, text="Clear Log", command=self.clear_log).pack(side="right")
 
-        startup_note = "Administrator mode active. System and network adapter tuning are enabled."
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True)
+
+        self.log_text = tk.Text(frame, wrap="word", relief="solid", borderwidth=1, bg="#f8fafc")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scroll.set, state="disabled")
+
+        self.log_text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        startup_note = "Administrator mode active. Use tabs above to run actions by category."
         self.log(startup_note)
+
+    def clear_log(self) -> None:
+        self._set_readonly_text(self.log_text, "")
 
     def log(self, message: str) -> None:
         def write() -> None:
@@ -1117,6 +1153,16 @@ class R6FixerApp:
                 self.log(f"[{title}] failed: {exc}")
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def refresh_users_and_bans(self) -> str:
+        summary = self.refresh_users()
+        user_ids = sorted(self.user_sources.keys())
+        if not user_ids:
+            return summary
+
+        self.log("Auto-checking bans for detected accounts...")
+        ban_summary = self.check_bans(user_ids)
+        return f"{summary}; {ban_summary}"
 
     def refresh_users(self) -> str:
         self.user_sources = collect_user_ids()
@@ -1224,7 +1270,7 @@ class R6FixerApp:
                 f"Cleaned {user_id}: removed {len(removed)} item(s), skipped {len(skipped)} item(s)"
             )
 
-        self.refresh_users()
+        self.refresh_users_and_bans()
         return (
             f"Removed {total_removed} file/folder item(s), skipped {total_skipped} item(s) "
             f"across {len(user_ids)} user(s)"
@@ -1430,7 +1476,7 @@ class R6FixerApp:
 
     def run_full_optimization(self) -> str:
         steps = [
-            self.refresh_users,
+            self.refresh_users_and_bans,
             self.apply_gamesettings_to_all,
             self.clear_r6_shader_cache,
             self.clear_ubisoft_cache,
