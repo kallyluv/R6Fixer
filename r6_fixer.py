@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import webbrowser
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ from urllib.request import Request, urlopen
 
 APP_TITLE = "R6Fixer"
 DEFAULT_REFRESH_RATE = 144
+CLOUDFLARE_DNS_IPV4 = ("1.1.1.1", "1.0.0.1")
+CLOUDFLARE_DNS_IPV6 = ("2606:4700:4700::1111", "2606:4700:4700::1001")
 ID_PATTERN = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -73,6 +76,202 @@ def is_admin() -> bool:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
+
+
+def relaunch_as_admin() -> bool:
+    try:
+        if getattr(sys, "frozen", False):
+            params = subprocess.list2cmdline(sys.argv[1:])
+        else:
+            script_path = str(Path(sys.argv[0]).resolve())
+            params = subprocess.list2cmdline([script_path, *sys.argv[1:]])
+
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None,
+            "runas",
+            sys.executable,
+            params,
+            None,
+            1,
+        )
+        return result > 32
+    except Exception:
+        return False
+
+
+def ensure_admin_or_relaunch() -> bool:
+    if is_admin():
+        return True
+
+    if relaunch_as_admin():
+        return False
+
+    try:
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            "R6Fixer requires Administrator privileges. Please relaunch as Administrator.",
+            APP_TITLE,
+            0x10,
+        )
+    except Exception:
+        pass
+
+    return False
+
+
+def get_active_network_adapters() -> list[dict[str, str]]:
+    script = (
+        "$adapters = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.Status -eq 'Up' -and $_.HardwareInterface -eq $true -and "
+        "$_.InterfaceDescription -notmatch 'Hyper-V|VMware|VirtualBox|Loopback|Bluetooth|TAP|TUN|VPN|Npcap' }; "
+        "if (-not $adapters) { "
+        "$adapters = Get-NetAdapter -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.Status -eq 'Up' -and ($_.Name -match 'Wi[- ]?Fi|Ethernet') } "
+        "}; "
+        "$adapters | ForEach-Object { \"$($_.Name)|$($_.NdisPhysicalMedium)\" }"
+    )
+
+    ok, output = run_command(["powershell", "-NoProfile", "-Command", script], timeout=35)
+    if not ok:
+        return []
+
+    adapters: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for line in output.splitlines():
+        row = line.strip()
+        if not row:
+            continue
+        if row.lower().startswith(("name", "----")):
+            continue
+
+        if "|" in row:
+            name, medium = row.split("|", 1)
+        else:
+            name, medium = row, "Unknown"
+
+        name = name.strip()
+        medium = medium.strip() or "Unknown"
+        if name in seen:
+            continue
+
+        seen.add(name)
+        adapters.append({"alias": name, "medium": medium})
+
+    return adapters
+
+
+def get_adapter_metric(mode: str, medium: str, alias: str) -> int:
+    signal = f"{medium} {alias}".lower()
+    is_wifi = any(marker in signal for marker in ("802_11", "wireless", "wi-fi", "wifi", "wlan"))
+
+    if mode == "throughput":
+        return 25 if is_wifi else 15
+    return 20 if is_wifi else 10
+
+
+def apply_adapter_network_settings(
+    adapters: list[dict[str, str]],
+    mode: str,
+) -> tuple[int, int, list[str]]:
+    success = 0
+    total = 0
+    logs: list[str] = []
+
+    for adapter in adapters:
+        alias = adapter["alias"]
+        medium = adapter.get("medium", "Unknown")
+        metric = get_adapter_metric(mode, medium, alias)
+        escaped_alias = alias.replace("'", "''")
+
+        dns_script = (
+            "$ErrorActionPreference='Stop';"
+            f"$alias='{escaped_alias}';"
+            "Set-DnsClientServerAddress "
+            "-InterfaceAlias $alias "
+            f"-ServerAddresses @('{CLOUDFLARE_DNS_IPV4[0]}','{CLOUDFLARE_DNS_IPV4[1]}') "
+            "-AddressFamily IPv4;"
+            "try { Set-DnsClientServerAddress -InterfaceAlias $alias -AddressFamily IPv6 "
+            "-ServerAddresses @('"
+            + CLOUDFLARE_DNS_IPV6[0]
+            + "','"
+            + CLOUDFLARE_DNS_IPV6[1]
+            + "') -ErrorAction Stop } catch { }"
+        )
+        total += 1
+        ok_dns, out_dns = run_command(
+            ["powershell", "-NoProfile", "-Command", dns_script],
+            timeout=35,
+        )
+        if ok_dns:
+            success += 1
+        else:
+            logs.append(f"DNS command failed on {alias}")
+        if out_dns:
+            logs.append(out_dns)
+
+        metric_script = (
+            "$ErrorActionPreference='Stop';"
+            f"$alias='{escaped_alias}';"
+            f"$metric={metric};"
+            "Set-NetIPInterface -InterfaceAlias $alias -AddressFamily IPv4 "
+            "-AutomaticMetric Disabled -InterfaceMetric $metric;"
+            "try { Set-NetIPInterface -InterfaceAlias $alias -AddressFamily IPv6 "
+            "-AutomaticMetric Disabled -InterfaceMetric $metric -ErrorAction Stop } catch { };"
+            "try { Set-DnsClient -InterfaceAlias $alias -RegisterThisConnectionsAddress $true "
+            "-UseSuffixWhenRegistering $false -ErrorAction Stop } catch { }"
+        )
+        total += 1
+        ok_metric, out_metric = run_command(
+            ["powershell", "-NoProfile", "-Command", metric_script],
+            timeout=40,
+        )
+        if ok_metric:
+            success += 1
+        else:
+            logs.append(f"Metric/registration command failed on {alias}")
+        if out_metric:
+            logs.append(out_metric)
+
+        power_script = (
+            f"$alias='{escaped_alias}';"
+            "if (Get-Command Disable-NetAdapterPowerManagement -ErrorAction SilentlyContinue) {"
+            "  try { Disable-NetAdapterPowerManagement -Name $alias -NoRestart -ErrorAction Stop } catch { }"
+            "}"
+        )
+        total += 1
+        ok_power, out_power = run_command(
+            ["powershell", "-NoProfile", "-Command", power_script],
+            timeout=35,
+        )
+        if ok_power:
+            success += 1
+        else:
+            logs.append(f"Power-management tuning failed on {alias}")
+        if out_power:
+            logs.append(out_power)
+
+        if ok_dns:
+            logs.append(
+                f"{alias}: DNS {CLOUDFLARE_DNS_IPV4[0]}/{CLOUDFLARE_DNS_IPV4[1]}, metric {metric}"
+            )
+
+    flush_ok, flush_output = run_command(["ipconfig", "/flushdns"], timeout=20)
+    if flush_output:
+        logs.append(flush_output)
+    if not flush_ok:
+        logs.append("DNS cache flush failed")
+
+    clear_ok, clear_output = run_command(
+        ["powershell", "-NoProfile", "-Command", "Clear-DnsClientCache"],
+        timeout=20,
+    )
+    total += 1
+    if clear_ok:
+        success += 1
+    if clear_output:
+        logs.append(clear_output)
+
+    return success, total, logs
 
 
 def get_source_specs() -> list[IdSourceSpec]:
@@ -392,18 +591,58 @@ def find_r6_executables() -> list[Path]:
 
 
 def check_ban_status(user_id: str, timeout: int = 10) -> str:
+    def classify_statscc_profile_status(page_text: str) -> str:
+        normalized = " ".join(page_text.lower().split())
+
+        if "rank reset due to ban" in normalized:
+            return "Banned"
+
+        section_match = re.search(r"ubisoft bans(.{0,240})", normalized)
+        if section_match:
+            section = section_match.group(1)
+            if "no ban" in section or "none" in section:
+                return "Not banned"
+
+            reason_markers = (
+                "cheating",
+                "toxic",
+                "abusive",
+                "grief",
+                "exploit",
+                "fraud",
+                "battleye",
+            )
+            if any(marker in section for marker in reason_markers):
+                return "Banned"
+
+            if re.search(r"\b\d+\s+(minute|hour|day|week|month|year)s?\s+ago\b", section):
+                return "Banned"
+
+        if any(
+            marker in normalized
+            for marker in ("battleye banned", "permanently banned", "temporarily banned")
+        ):
+            return "Banned"
+
+        # If the profile loaded and no ban notice is present, treat as not banned.
+        profile_markers = ("last played", "current season", "max ranks", "username history")
+        if any(marker in normalized for marker in profile_markers):
+            return "Not banned"
+
+        return "Unknown"
+
     urls = [
-        f"https://stats.cc/siege/player/{user_id}",
+        f"https://stats.cc/siege/-/{user_id}",
         f"https://stats.cc/siege/{user_id}",
+        f"https://stats.cc/siege/player/{user_id}",
     ]
-    banned_hints = ["banned", "battleye banned", "permanently banned"]
-    clean_hints = ["not banned", "no ban"]
 
     for url in urls:
         request = Request(
             url,
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
             },
         )
         try:
@@ -412,11 +651,9 @@ def check_ban_status(user_id: str, timeout: int = 10) -> str:
         except (HTTPError, URLError, TimeoutError):
             continue
 
-        if any(hint in body for hint in clean_hints):
-            return "Not banned"
-        if any(hint in body for hint in banned_hints):
-            return "Banned"
-        return "Unknown"
+        status = classify_statscc_profile_status(body)
+        if status in {"Banned", "Not banned"}:
+            return status
 
     return "Unavailable"
 
@@ -615,7 +852,18 @@ class R6FixerApp:
         self._build_actions_panel(right)
 
     def _build_users_panel(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="Discovered Ubisoft Users", style="SectionHeader.TLabel").pack(anchor="w")
+        header = ttk.Frame(parent)
+        header.pack(fill="x")
+
+        ttk.Label(header, text="Discovered Ubisoft Users", style="SectionHeader.TLabel").pack(
+            side="left",
+            anchor="w",
+        )
+        self.user_count_var = tk.StringVar(value="0 user(s)")
+        ttk.Label(header, textvariable=self.user_count_var, style="Hint.TLabel").pack(
+            side="right",
+            anchor="e",
+        )
 
         columns = ("user_id", "locations", "ban")
         self.user_tree = ttk.Treeview(parent, columns=columns, show="headings", height=13)
@@ -782,7 +1030,10 @@ class R6FixerApp:
             network_section,
             2,
             "Apply Network Optimizations",
-            "Runs netsh TCP tweaks for the selected mode. Admin rights recommended.",
+            (
+                "Runs global TCP tuning and applies Cloudflare DNS (1.1.1.1 / 1.0.0.1) "
+                "to active Ethernet and Wi-Fi adapters."
+            ),
             lambda: self.run_async("Applying network optimizations", self.apply_network_optimizations),
         )
 
@@ -841,7 +1092,7 @@ class R6FixerApp:
         self.log_text.pack(fill="both", expand=False)
         self.log_text.configure(state="disabled")
 
-        startup_note = "Run this tool as Administrator to allow all system-level actions to complete."
+        startup_note = "Administrator mode active. System and network adapter tuning are enabled."
         self.log(startup_note)
 
     def log(self, message: str) -> None:
@@ -1033,25 +1284,55 @@ class R6FixerApp:
         if not is_admin():
             return "Admin rights are required for network tweaks. Relaunch as Administrator."
 
+        adapters = get_active_network_adapters()
+        if not adapters:
+            return "No active physical Ethernet/Wi-Fi adapters were detected"
+
+        adapter_summaries = [f"{item['alias']} ({item.get('medium', 'Unknown')})" for item in adapters]
+        self.log("Active network adapters: " + ", ".join(adapter_summaries))
+
         mode = self.network_mode.get()
+        common_commands = [
+            ["netsh", "int", "tcp", "set", "heuristics", "disabled"],
+            ["netsh", "int", "tcp", "set", "global", "rss=enabled"],
+            ["netsh", "int", "tcp", "set", "global", "rsc=disabled"],
+            ["netsh", "int", "tcp", "set", "global", "timestamps=disabled"],
+            ["netsh", "int", "tcp", "set", "global", "nonsackrttresiliency=disabled"],
+            ["netsh", "int", "ip", "set", "global", "taskoffload=enabled"],
+        ]
+
         if mode == "throughput":
-            commands = [
-                ["netsh", "int", "tcp", "set", "heuristics", "disabled"],
+            mode_commands = [
                 ["netsh", "int", "tcp", "set", "global", "autotuninglevel=normal"],
-                ["netsh", "int", "tcp", "set", "global", "rss=enabled"],
-                ["netsh", "int", "tcp", "set", "global", "congestionprovider=ctcp"],
                 ["netsh", "int", "tcp", "set", "global", "ecncapability=enabled"],
+                [
+                    "netsh",
+                    "int",
+                    "tcp",
+                    "set",
+                    "supplemental",
+                    "internet",
+                    "congestionprovider=ctcp",
+                ],
             ]
             mode_name = "Throughput + Downloads"
         else:
-            commands = [
-                ["netsh", "int", "tcp", "set", "heuristics", "disabled"],
+            mode_commands = [
                 ["netsh", "int", "tcp", "set", "global", "autotuninglevel=highlyrestricted"],
-                ["netsh", "int", "tcp", "set", "global", "rss=enabled"],
                 ["netsh", "int", "tcp", "set", "global", "ecncapability=disabled"],
-                ["netsh", "int", "tcp", "set", "global", "timestamps=disabled"],
+                [
+                    "netsh",
+                    "int",
+                    "tcp",
+                    "set",
+                    "supplemental",
+                    "internet",
+                    "congestionprovider=cubic",
+                ],
             ]
             mode_name = "Latency + Stability"
+
+        commands = common_commands + mode_commands
 
         success = 0
         for cmd in commands:
@@ -1063,7 +1344,14 @@ class R6FixerApp:
             if output:
                 self.log(output)
 
-        return f"Applied {success}/{len(commands)} network commands for mode: {mode_name}"
+        adapter_success, adapter_total, adapter_logs = apply_adapter_network_settings(adapters, mode)
+        for item in adapter_logs:
+            self.log(item)
+
+        return (
+            f"Applied {success}/{len(commands)} network commands for mode: {mode_name}; "
+            f"adapter tuning applied in {adapter_success}/{adapter_total} operations"
+        )
 
     def set_power_plan(self) -> str:
         if not is_admin():
@@ -1165,6 +1453,9 @@ class R6FixerApp:
 
 
 def main() -> None:
+    if not ensure_admin_or_relaunch():
+        return
+
     root = tk.Tk()
     app = R6FixerApp(root)
     root.mainloop()
