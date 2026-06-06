@@ -1046,7 +1046,8 @@ class R6FixerApp:
             mode_box,
             text=(
                 "Choose the profile then apply optimization. Cloudflare DNS and adapter-level tuning "
-                "will be applied to active Ethernet and Wi-Fi adapters."
+                "will be applied to active Ethernet and Wi-Fi adapters. Lowest ping can vary by "
+                "router/ISP, so test both profiles if needed."
             ),
             style="Hint.TLabel",
             wraplength=980,
@@ -1058,7 +1059,7 @@ class R6FixerApp:
 
         ttk.Radiobutton(
             mode_row,
-            text="Latency + Stability",
+            text="Latency + Stability (Ping-First)",
             variable=self.network_mode,
             value="latency",
         ).pack(side="left", padx=(0, 12))
@@ -1358,14 +1359,14 @@ class R6FixerApp:
                     "set",
                     "supplemental",
                     "internet",
-                    "congestionprovider=ctcp",
+                    "congestionprovider=cubic",
                 ],
             ]
             mode_name = "Throughput + Downloads"
         else:
             mode_commands = [
-                ["netsh", "int", "tcp", "set", "global", "autotuninglevel=highlyrestricted"],
-                ["netsh", "int", "tcp", "set", "global", "ecncapability=disabled"],
+                ["netsh", "int", "tcp", "set", "global", "autotuninglevel=normal"],
+                ["netsh", "int", "tcp", "set", "global", "ecncapability=enabled"],
                 [
                     "netsh",
                     "int",
@@ -1373,10 +1374,10 @@ class R6FixerApp:
                     "set",
                     "supplemental",
                     "internet",
-                    "congestionprovider=cubic",
+                    "congestionprovider=ctcp",
                 ],
             ]
-            mode_name = "Latency + Stability"
+            mode_name = "Latency + Stability (Ping-First)"
 
         commands = common_commands + mode_commands
 
